@@ -56,6 +56,7 @@ team_season_agg = (
         MedianScoreDiff=("ScoreDiff", "median"),
         MinScoreDiff=("ScoreDiff", "min"),
         MaxScoreDiff=("ScoreDiff", "max"),
+        VarScoreDiff=("ScoreDiff", "var"),
         Wins=("Win", "sum"),
         Losses=("GameResult", lambda x: (x == "L").sum()),
         WinPercentage=("Win", "mean"),
@@ -98,15 +99,18 @@ df_team_tourney_results["Win"] = (df_team_tourney_results["GameResult"] == "W").
 
 # %%
 df_historic_tourney_features = df_team_tourney_results.merge(
-    team_season_agg[["Season", "League", "TeamID", "WinPercentage", "MedianScoreDiff", "ChalkSeed"]],
+    team_season_agg[["Season", "League", "TeamID", "WinPercentage", "MedianScoreDiff", "VarScoreDiff", "ChalkSeed"]],
     on=["Season", "League", "TeamID"],
     how="left",
 ).merge(
-    team_season_agg[["Season", "League", "TeamID", "WinPercentage", "MedianScoreDiff", "ChalkSeed"]].rename(
+    team_season_agg[
+        ["Season", "League", "TeamID", "WinPercentage", "VarScoreDiff", "MedianScoreDiff", "ChalkSeed"]
+    ].rename(
         columns={
             "TeamID": "OppTeamID",
             "WinPercentage": "OppWinPercentage",
             "MedianScoreDiff": "OppMedianScoreDiff",
+            "VarScoreDiff": "OppVarScoreDiff",
             "ChalkSeed": "OppChalkSeed",
         }
     ),
@@ -126,6 +130,9 @@ df_historic_tourney_features["MedianScoreDiffDiff"] = (
     df_historic_tourney_features["MedianScoreDiff"] - df_historic_tourney_features["OppMedianScoreDiff"]
 )
 
+df_historic_tourney_features["VarScoreDiffDiff"] = (
+    df_historic_tourney_features["VarScoreDiff"] - df_historic_tourney_features["OppVarScoreDiff"]
+)
 # %%
 df_historic_tourney_features["BaselinePred"] = (
     df_historic_tourney_features["ChalkSeed"] < df_historic_tourney_features["OppChalkSeed"]
@@ -149,5 +156,129 @@ for season in df_historic_tourney_features["Season"].unique():
     print(f"Holdout season {season} - Accuracy {score:0.4f} Log Loss {score_ll:0.4f}")
 
 print(f"Baseline accuracy {np.mean(cv_scores_baseline):0.4f}")
+
+# %%
+import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import log_loss, accuracy_score
+import numpy as np
+
+FEATURES = ["WinPctDiff", "ChalkSeedDiff", "MedianScoreDiffDiff", "VarScoreDiffDiff"]
+TARGET = "Win"
+
+X = df_historic_tourney_features[FEATURES]
+y = df_historic_tourney_features[TARGET]
+groups = df_historic_tourney_features["Season"]
+seasons = df_historic_tourney_features["Season"].unique()
+
+# Setup cross-validation
+gkf = GroupKFold(n_splits=df_historic_tourney_features["Season"].nunique())
+cv_results = []
+models = []
+
+season_idx = 0
+for train_index, test_index in gkf.split(X, y, groups):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    # Prepare the model
+    model = lgb.LGBMRegressor(
+        objective="binary",
+        n_estimators=1000,
+        learning_rate=0.001,
+    )
+    holdout_season = seasons[season_idx]
+    print(f"Holdout Season: {holdout_season}")
+
+    # Train the model
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)])
+
+    # Predict on the test set
+    y_pred = model.predict(X_test)
+    score_ll = log_loss(y_test, y_pred)
+    y_pred = y_pred > 0.5
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    cv_results.append(accuracy)
+    season_idx += 1
+    print(f"Season {holdout_season}: {accuracy:.4f}, Log Loss: {score_ll:.4f}")
+    models.append(model)
+
+# Print the average accuracy across all folds
+print("Average CV Accuracy:", np.mean(cv_results))
+
+# %%
+from catboost import CatBoostClassifier
+
+X = df_historic_tourney_features[FEATURES]
+y = df_historic_tourney_features[TARGET]
+groups = df_historic_tourney_features["Season"]
+seasons = df_historic_tourney_features["Season"].unique()
+
+# Setup cross-validation
+gkf = GroupKFold(n_splits=df_historic_tourney_features["Season"].nunique())
+cv_results = []
+models = []
+
+season_idx = 0
+for train_index, test_index in gkf.split(X, y, groups):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    # Prepare the model
+    model = CatBoostClassifier(iterations=1000, learning_rate=0.001, depth=6, loss_function="Logloss", verbose=100)
+    holdout_season = seasons[season_idx]
+    print(f"Holdout Season: {holdout_season}")
+
+    # Train the model
+    model.fit(X_train, y_train, eval_set=(X_test, y_test), early_stopping_rounds=50)
+
+    # Predict on the test set
+    y_pred = model.predict(X_test)
+    score_ll = log_loss(y_test, y_pred)
+    y_pred = y_pred > 0.5
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    cv_results.append(accuracy)
+    season_idx += 1
+    print(f"Season {holdout_season}: {accuracy:.4f}, Log Loss: {score_ll:.4f}")
+    models.append(model)
+
+# Print the average accuracy across all folds
+print("Average CV Accuracy:", np.mean(cv_results))
+
+# %%
+import xgboost as xgb
+
+season_idx = 0
+for train_index, test_index in gkf.split(X, y, groups):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    # Prepare the model
+    model = xgb.XGBRegressor(
+        eval_metric="logloss",
+        n_estimators=1_000,
+        learning_rate=0.001,
+    )
+    holdout_season = seasons[season_idx]
+    print(f"Holdout Season: {holdout_season}")
+    # Train the model
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=100)
+
+    # Predict on the test set
+    y_pred = model.predict(X_test)
+    score_ll = log_loss(y_test, y_pred)
+    y_pred = y_pred > 0.5
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    cv_results.append(accuracy)
+    season_idx += 1
+    print(f"Season {holdout_season}: {accuracy} {score_ll}")
+    models.append(model)
+# Print the average accuracy across all folds
+print("Average CV Accuracy:", np.mean(cv_results))
 
 # %%
